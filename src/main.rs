@@ -27,6 +27,13 @@ const DEFAULT_HAMMERSPOON_CLI: &str = "/opt/homebrew/bin/hs";
 enum Command {
     MoveFocus(Direction),
     MoveFocusOrTab(Direction),
+    // Sent via `zellij pipe` (not the KDL keybind) by the neovim-side plugin
+    // once nvim has already exhausted its own splits in this direction.
+    // Skips the current_pane_is_vim() forward-to-nvim check below -- that's
+    // exactly the case we're already past -- and goes straight to the
+    // tiled-neighbor-or-escalate logic.
+    MoveFocusFromEditor(Direction),
+    MoveFocusOrTabFromEditor(Direction),
     Resize(Direction),
 }
 
@@ -125,14 +132,23 @@ impl State {
     }
 
     fn execute_command(&mut self, command: Command) {
-        if self.current_pane_is_vim() {
+        let forward_to_editor = self.current_pane_is_vim()
+            && !matches!(
+                command,
+                Command::MoveFocusFromEditor(_) | Command::MoveFocusOrTabFromEditor(_)
+            );
+        if forward_to_editor {
             write_chars(&self.command_to_keybind(&command));
             return;
         }
 
         match command {
-            Command::MoveFocus(direction) => self.move_focus_smart(direction, false),
-            Command::MoveFocusOrTab(direction) => self.move_focus_smart(direction, true),
+            Command::MoveFocus(direction) | Command::MoveFocusFromEditor(direction) => {
+                self.move_focus_smart(direction, false)
+            }
+            Command::MoveFocusOrTab(direction) | Command::MoveFocusOrTabFromEditor(direction) => {
+                self.move_focus_smart(direction, true)
+            }
             Command::Resize(direction) => {
                 resize_focused_pane_with_direction(Resize::Increase, direction)
             }
@@ -242,14 +258,22 @@ impl State {
     }
 
     fn command_to_keybind(&mut self, command: &Command) -> String {
+        // MoveFocusFromEditor/MoveFocusOrTabFromEditor never reach here in
+        // practice (execute_command routes them straight to move_focus_smart),
+        // but are included for match exhaustiveness.
         let modifiers = match command {
-            Command::MoveFocus(_) | Command::MoveFocusOrTab(_) => &self.move_mod,
+            Command::MoveFocus(_)
+            | Command::MoveFocusOrTab(_)
+            | Command::MoveFocusFromEditor(_)
+            | Command::MoveFocusOrTabFromEditor(_) => &self.move_mod,
             Command::Resize(_) => &self.resize_mod,
         };
 
         let direction = match command {
             Command::MoveFocus(direction)
             | Command::MoveFocusOrTab(direction)
+            | Command::MoveFocusFromEditor(direction)
+            | Command::MoveFocusOrTabFromEditor(direction)
             | Command::Resize(direction) => direction,
         };
 
@@ -390,6 +414,8 @@ fn parse_command(pipe_message: PipeMessage) -> Option<Command> {
     match command.as_str() {
         "move_focus" => Some(Command::MoveFocus(direction)),
         "move_focus_or_tab" => Some(Command::MoveFocusOrTab(direction)),
+        "move_focus_from_editor" => Some(Command::MoveFocusFromEditor(direction)),
+        "move_focus_or_tab_from_editor" => Some(Command::MoveFocusOrTabFromEditor(direction)),
         "resize" => Some(Command::Resize(direction)),
         _ => None,
     }
