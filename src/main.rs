@@ -2,6 +2,7 @@ use zellij_tile::prelude::*;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::str::FromStr;
+use std::time::{Duration, Instant};
 
 struct State {
     permissions_granted: bool,
@@ -9,6 +10,13 @@ struct State {
     current_pane_id: Option<PaneId>,
     pane_manifest: Option<PaneManifest>,
     command_queue: VecDeque<Command>,
+    // guards against escalating twice for one logical keypress: run_command
+    // is fire-and-forget, so there's a window before Hammerspoon actually
+    // moves OS focus where the pane title (what decides whether a keypress
+    // reaches us at all) still looks unchanged. A fast repeat in that window
+    // -- key-repeat, or a reflexive second tap -- would otherwise escalate
+    // again from the still-current pane and overshoot by one window.
+    last_escalation: Option<Instant>,
 
     // Configuration
     move_mod: Vec<Mod>,
@@ -16,6 +24,8 @@ struct State {
     use_arrow_keys: bool,
     hammerspoon_cli: String,
 }
+
+const ESCALATION_DEBOUNCE: Duration = Duration::from_millis(400);
 
 // run_command's subprocess environment isn't guaranteed to carry the
 // interactive shell's PATH, so this wants to be an absolute path. Default
@@ -116,6 +126,7 @@ impl Default for State {
             current_pane_id: None,
             pane_manifest: None,
             command_queue: VecDeque::new(),
+            last_escalation: None,
 
             move_mod: vec![Mod::Ctrl],
             resize_mod: vec![Mod::Alt],
@@ -159,7 +170,7 @@ impl State {
     /// tab; if `try_tab` and there's another tab, fall back to zellij's own
     /// tab-cycling; otherwise there's truly nothing left in zellij, so hand
     /// off to Codex (via Hammerspoon) to move OS-level window focus instead.
-    fn move_focus_smart(&self, direction: Direction, try_tab: bool) {
+    fn move_focus_smart(&mut self, direction: Direction, try_tab: bool) {
         if self.has_tiled_neighbor(direction) {
             move_focus(direction);
             return;
@@ -217,7 +228,15 @@ impl State {
         self.pane_manifest.as_ref().is_some_and(|m| m.panes.len() > 1)
     }
 
-    fn escalate_to_hammerspoon(&self, direction: Direction) {
+    fn escalate_to_hammerspoon(&mut self, direction: Direction) {
+        let now = Instant::now();
+        if let Some(last) = self.last_escalation {
+            if now.duration_since(last) < ESCALATION_DEBOUNCE {
+                return;
+            }
+        }
+        self.last_escalation = Some(now);
+
         let action = match direction {
             Direction::Left => "focus_left",
             Direction::Right => "focus_right",
